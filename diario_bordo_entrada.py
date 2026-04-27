@@ -16,6 +16,7 @@ CORREÇÕES APLICADAS (v2):
 """
 
 import os
+import html as html_mod
 import json
 import time
 import shutil
@@ -539,7 +540,7 @@ def page_cadastro_projeto():
         st.session_state["aplicar_backlog"] = False
 
     # TECNOLOGIA
-    if not df_tec.empty:
+    if not df_tec.empty and "ATIVO" in df_tec.columns and "TECNOLOGIA" in df_tec.columns:
         lista_tecnologia = sorted(
             df_tec[df_tec["ATIVO"].astype(str).str.upper() == "SIM"]["TECNOLOGIA"]
             .dropna().astype(str).str.strip().unique().tolist()
@@ -589,7 +590,7 @@ def page_cadastro_projeto():
     lista_dv = lista_unica(df_controle, "DV")
 
     def lista_resp_por_funcao(funcao):
-        if df_resp.empty:
+        if df_resp.empty or "FUNCAO" not in df_resp.columns or "ATIVO" not in df_resp.columns:
             return lista_unica(df_controle, funcao)
         mask = (
             df_resp["FUNCAO"].astype(str).str.strip().str.upper().str.contains(funcao, na=False)
@@ -881,6 +882,9 @@ def page_atualizar_diario():
 
         # SELEÇÃO DO PROJETO
         st.divider()
+        if "PROJETO" not in df_controle.columns:
+            st.error("Coluna PROJETO não encontrada na base de controle. Verifique o arquivo d_Controle_Projetos.xlsx.")
+            st.stop()
         lista_projetos = sorted(df_controle["PROJETO"].dropna().astype(str).unique())
         projeto = st.selectbox("Projeto", lista_projetos)
 
@@ -949,6 +953,9 @@ def page_atualizar_diario():
             cec_projeto = linha_proj.get("CEC")
 
         # ETAPA / APONTAMENTO
+        if "STATUS_MACRO" not in df_apontamentos.columns:
+            st.error("Coluna STATUS_MACRO não encontrada em d_apontamentos. Verifique o arquivo.")
+            st.stop()
         lista_macros = sorted(df_apontamentos["STATUS_MACRO"].dropna().astype(str).unique())
         macro = st.selectbox("Etapa", lista_macros)
 
@@ -987,7 +994,7 @@ def page_atualizar_diario():
 
         st.divider()
 
-        data_realizado = st.date_input("Data em que o evento aconteceu", key="data_form")
+        data_realizado = st.date_input("Data em que o evento aconteceu", key="data_realizado_form")
         data_obs = date.today()
         observacao = st.text_area("Observação", height=120, key="obs_form")
 
@@ -1077,8 +1084,8 @@ def page_atualizar_diario():
                 macro_txt    = str(row.get("STATUS_MACRO", "")).strip()
                 apont_txt    = str(row.get("APONTAMENTO_ATIVO", "")).strip()
                 status_txt   = str(row.get("STATUS", "")).strip()
-                obs_txt      = str(row.get("OBSERVACAO", "")).strip() or "Sem observação"
-                area_txt     = str(row.get("RESPONSAVEL_AREA", "")).strip()
+                obs_txt      = html_mod.escape(str(row.get("OBSERVACAO", "")).strip() or "Sem observação")
+                area_txt     = html_mod.escape(str(row.get("RESPONSAVEL_AREA", "")).strip())
                 pendencia_txt= str(row.get("PENDENCIA_APONTAMENTO", "")).strip()
                 cor_status   = "#EF4444" if pendencia_txt == "Sim" else mapa_cores.get(status_txt, "#94A3B8")
 
