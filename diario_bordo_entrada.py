@@ -13,11 +13,20 @@ CORREÇÕES APLICADAS (v2):
             para garantir que o OneDrive sincronizou o arquivo antes de prosseguir.
             Também verifica propriedade do lock (maquina + usuario) após o wait.
   - Bug 3: salvar_controle recebe o mesmo tratamento de escrita segura via temp local.
+
+MELHORIAS (v3) — Robustez do lock OneDrive:
+  - Melhoria 1: Jitter aleatório (0–3 s) antes de tentar o lock para reduzir
+                colisão simultânea entre analistas.
+  - Melhoria 2: LOCK_SYNC_WAIT aumentado de 4 s → 10 s para cobrir conexões lentas.
+  - Melhoria 3: Verificação dupla da propriedade do lock após o sync wait.
+  - Melhoria 4: _limpar_conflitos_onedrive() remove arquivos de conflito gerados
+                pelo OneDrive após cada gravação bem-sucedida.
 """
 
 import os
 import html as html_mod
 import json
+import random
 import time
 import shutil
 import tempfile
@@ -54,7 +63,7 @@ LOCK_CONTROLE  = Path(PATH_CONTROLE).with_suffix(".lock")
 
 LOCK_TIMEOUT   = 30   # segundos aguardando lock ser liberado
 LOCK_MAX_IDADE = 120  # segundos para considerar lock morto (crash/desligamento)
-LOCK_SYNC_WAIT = 4    # segundos aguardando OneDrive sincronizar o lock antes de confirmar
+LOCK_SYNC_WAIT = 10   # segundos aguardando OneDrive sincronizar o lock antes de confirmar
 
 
 # ==============================
@@ -109,14 +118,18 @@ def adquirir_lock(lock_path: Path, timeout: int = LOCK_TIMEOUT) -> bool:
     Adquire o lock compartilhado no OneDrive de forma segura.
 
     Fluxo:
-      1. Se o lock existir, verifica se está morto (idade > LOCK_MAX_IDADE).
+      1. MELHORIA 1: jitter aleatório (0–3 s) para dessincronizar tentativas simultâneas.
+      2. Se o lock existir, verifica se está morto (idade > LOCK_MAX_IDADE).
          Se morto, remove e tenta adquirir. Senão, aguarda e repete.
-      2. Cria o lock atomicamente com os.O_EXCL.
-      3. CORREÇÃO Bug 2: aguarda LOCK_SYNC_WAIT segundos para o OneDrive
-         sincronizar o arquivo antes de prosseguir.
-      4. Confirma que o lock ainda pertence a esta máquina/usuário.
+      3. Cria o lock atomicamente com os.O_EXCL.
+      4. MELHORIA 2: aguarda LOCK_SYNC_WAIT (10 s) para o OneDrive sincronizar.
+      5. MELHORIA 3: verificação dupla da propriedade (lê o lock 2 vezes com 1 s
+         de intervalo) — garante que o sync estava completo na primeira leitura.
          Se outro PC sobrescreveu durante o wait, tenta novamente.
     """
+    # MELHORIA 1: jitter — cada máquina espera um tempo aleatório diferente
+    time.sleep(random.uniform(0, 3))
+
     inicio = time.time()
 
     while time.time() - inicio < timeout:
@@ -148,16 +161,22 @@ def adquirir_lock(lock_path: Path, timeout: int = LOCK_TIMEOUT) -> bool:
             time.sleep(2)
             continue
 
-        # --- CORREÇÃO Bug 2: aguarda sync do OneDrive ---
+        # MELHORIA 2: aguarda sync completo do OneDrive (10 s)
         time.sleep(LOCK_SYNC_WAIT)
 
-        # --- confirma propriedade do lock ---
-        try:
-            dados = json.loads(lock_path.read_text(encoding="utf-8"))
-            if dados.get("maquina") == _maquina() and dados.get("usuario") == _usuario():
-                return True  # lock confirmado
-        except Exception:
-            pass
+        # MELHORIA 3: verificação dupla — lê o lock 2 vezes com 1 s de intervalo
+        confirmacoes = 0
+        for _ in range(2):
+            try:
+                dados = json.loads(lock_path.read_text(encoding="utf-8"))
+                if dados.get("maquina") == _maquina() and dados.get("usuario") == _usuario():
+                    confirmacoes += 1
+            except Exception:
+                pass
+            time.sleep(1)
+
+        if confirmacoes == 2:
+            return True  # lock confirmado duas vezes — seguro prosseguir
 
         # outro PC sobrescreveu durante o wait — tenta novamente
         time.sleep(2)
@@ -168,6 +187,36 @@ def adquirir_lock(lock_path: Path, timeout: int = LOCK_TIMEOUT) -> bool:
 def liberar_lock(lock_path: Path) -> None:
     try:
         lock_path.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
+def _limpar_conflitos_onedrive(path_original: str) -> None:
+    """
+    MELHORIA 4: remove arquivos de conflito gerados pelo OneDrive após gravação.
+
+    O OneDrive for Business cria cópias de conflito com nomes como:
+      - "f_Diario_Bordo-NomeDaMaquina.xlsx"
+      - "f_Diario_Bordo (NomeUsuario's conflicted copy YYYY-MM-DD).xlsx"
+      - "f_Diario_Bordo (version conflict 1).xlsx"
+
+    A heurística: qualquer arquivo na mesma pasta cujo nome comece com o stem
+    do arquivo original, tenha a mesma extensão, mas nome diferente do original.
+    """
+    original = Path(path_original)
+    pasta    = original.parent
+    stem     = original.stem
+    sufixo   = original.suffix
+
+    try:
+        for arquivo in pasta.iterdir():
+            if arquivo.name == original.name:
+                continue  # arquivo original — não remover
+            if arquivo.suffix.lower() == sufixo.lower() and arquivo.stem.startswith(stem):
+                try:
+                    arquivo.unlink()
+                except Exception:
+                    pass
     except Exception:
         pass
 
@@ -309,6 +358,7 @@ def salvar_controle(df: pd.DataFrame) -> bool:
     """Salva d_Controle_Projetos.xlsx usando escrita segura fora do OneDrive."""
     try:
         _salvar_xlsx_seguro(df, PATH_CONTROLE)
+        _limpar_conflitos_onedrive(PATH_CONTROLE)
         return True
     except Exception as e:
         st.error(f"Erro ao salvar Controle: {e}")
@@ -1038,6 +1088,9 @@ def page_atualizar_diario():
 
                 # CORREÇÃO Bug 1: usa _salvar_xlsx_seguro (temp fora do OneDrive)
                 _salvar_xlsx_seguro(df_final, PATH_DIARIO)
+
+                # MELHORIA 4: remove conflitos gerados pelo OneDrive após a gravação
+                _limpar_conflitos_onedrive(PATH_DIARIO)
 
                 # VERIFICAÇÃO PÓS-GRAVAÇÃO
                 df_check = pd.read_excel(PATH_DIARIO)
